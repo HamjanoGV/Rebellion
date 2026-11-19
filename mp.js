@@ -4,6 +4,18 @@ const PEER_PREFIX='rebellion-game-';
 const CODE_CHARS='ABCDEFGHJKLMNPQRSTUVWXYZ';
 const newCode=()=>Array.from({length:4},()=>CODE_CHARS[Math.floor(Math.random()*CODE_CHARS.length)]).join('');
 const ROOM_ERR='Room tidak ditemukan, sudah mulai, atau penuh.';
+// TURN bawaan PeerJS sudah mati sejak Des 2023, jadi kita beri server sendiri.
+// Server TURN publik di bawah ini gratis tapi tanpa jaminan. Kalau tidak jalan,
+// buat akun gratis di metered.ca (Open Relay) lalu ganti username & credential.
+const PEER_OPTS={debug:1,config:{iceServers:[
+  {urls:'stun:stun.l.google.com:19302'},
+  {urls:'stun:stun1.l.google.com:19302'},
+  {urls:'stun:global.stun.twilio.com:3478'},
+  {urls:'turn:openrelay.metered.ca:80',username:'openrelayproject',credential:'openrelayproject'},
+  {urls:'turn:openrelay.metered.ca:443',username:'openrelayproject',credential:'openrelayproject'},
+  {urls:'turn:openrelay.metered.ca:443?transport=tcp',username:'openrelayproject',credential:'openrelayproject'}
+]}};
+const mpLog=(...a)=>console.log('[MP]',...a);
 
 const ghosts=()=>MP?Object.values(MP.players).filter(o=>o.id!=MP.id&&o.x!=null):[];
 function multi(){show(`<h2>Multiplayer</h2><div class=nas>Pilih <b>Buat Room</b>, lalu bagikan kode 4 huruf ke temanmu. Teman membuka alamat game yang sama, memasukkan kode, dan menekan <b>Join Room</b>. Tidak perlu satu WiFi. Host (pembuat room) jangan keluar selama bermain.</div><br>
@@ -22,8 +34,9 @@ function mpConnect(kind){
 // ---------- HOST: menjalankan logika room (pengganti server.js) ----------
 function mpHost(tries){
   const code=newCode();
-  const peer=new Peer(PEER_PREFIX+code);
+  const peer=new Peer(PEER_PREFIX+code,PEER_OPTS);
   const conns=new Map(),order=[],ready={};
+  mpLog('host membuat room',code);
   let started=false,opened=false;
 
   const send=(c,o)=>{try{if(c.open)c.send(o)}catch(e){}};
@@ -59,12 +72,15 @@ function mpHost(tries){
 
   peer.on('open',()=>{
     opened=true;ws.readyState=1;order.push(peer.id);
+    mpLog('room siap, menunggu pemain. Kode:',code);
     local({t:'room',id:peer.id,code});
     lobby();
   });
 
   peer.on('connection',c=>{
+    mpLog('ada pemain mencoba join:',c.peer);
     c.on('open',()=>{
+      mpLog('koneksi ke pemain terbuka:',c.peer);
       if(started||order.length>=4){send(c,{t:'err',msg:ROOM_ERR});setTimeout(()=>{try{c.close()}catch(e){}},400);return}
       conns.set(c.peer,c);order.push(c.peer);
       send(c,{t:'room',id:c.peer,code});
@@ -99,8 +115,9 @@ function mpHost(tries){
 
 // ---------- PEMAIN: terhubung ke host ----------
 function mpJoin(code){
-  const peer=new Peer();
+  const peer=new Peer(PEER_OPTS);
   let conn=null,ended=false,joined=false,timer=null;
+  mpLog('mencoba join room',code);
 
   const ws={readyState:0,onclose:null,close(){
     if(ws.readyState==3)return;ws.readyState=3;
@@ -111,11 +128,12 @@ function mpJoin(code){
     send:o=>{try{if(conn&&conn.open)conn.send(o)}catch(e){}}};
 
   const fail=msg=>{if(MP===me)onMsg({t:'err',msg})};
-  timer=setTimeout(()=>{if(!joined)fail('Gagal terhubung ke room (waktu habis). Cek kode room dan koneksi internet.')},15000);
+  timer=setTimeout(()=>{if(!joined)fail('Gagal terhubung ke room (waktu habis). Kemungkinan jaringan kalian tidak bisa saling terhubung langsung. Coba WiFi yang sama atau hotspot, lalu coba lagi.')},25000);
 
-  peer.on('open',()=>{
+  peer.on('open',id=>{
+    mpLog('terhubung ke server perantara, id saya:',id);
     conn=peer.connect(PEER_PREFIX+code,{reliable:true,serialization:'json'});
-    conn.on('open',()=>{ws.readyState=1});
+    conn.on('open',()=>{ws.readyState=1;mpLog('koneksi ke host terbuka')});
     conn.on('data',m=>{
       if(!m||MP!==me)return;
       if(m.t=='room'){joined=true;clearTimeout(timer)}
@@ -134,6 +152,7 @@ function mpJoin(code){
 
   peer.on('error',e=>{
     clearTimeout(timer);
+    mpLog('error PeerJS (pemain):',e.type,e);
     if(MP!==me)return;
     if(e.type=='peer-unavailable')fail(ROOM_ERR);
     else if(!joined)fail('Gagal terhubung ('+e.type+'). Coba lagi.');
