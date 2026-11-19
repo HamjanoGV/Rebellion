@@ -1,20 +1,146 @@
-// ===== Multiplayer client (butuh server.js) =====
+// ===== Multiplayer client (peer-to-peer via PeerJS, tanpa server.js) =====
+// Host = pemain yang membuat room. Pemain lain terhubung langsung ke host.
+const PEER_PREFIX='rebellion-game-';
+const CODE_CHARS='ABCDEFGHJKLMNPQRSTUVWXYZ';
+const newCode=()=>Array.from({length:4},()=>CODE_CHARS[Math.floor(Math.random()*CODE_CHARS.length)]).join('');
+const ROOM_ERR='Room tidak ditemukan, sudah mulai, atau penuh.';
+
 const ghosts=()=>MP?Object.values(MP.players).filter(o=>o.id!=MP.id&&o.x!=null):[];
-function multi(){show(`<h2>Multiplayer</h2><div class=nas>Jalankan <b>node server.js</b> di satu komputer, lalu semua device buka alamat yang tampil di terminal (satu WiFi), bukan lewat file atau Live Server.</div><br>
+function multi(){show(`<h2>Multiplayer</h2><div class=nas>Pilih <b>Buat Room</b>, lalu bagikan kode 4 huruf ke temanmu. Teman membuka alamat game yang sama, memasukkan kode, dan menekan <b>Join Room</b>. Tidak perlu satu WiFi. Host (pembuat room) jangan keluar selama bermain.</div><br>
  <button onclick="mpConnect('create')">Buat Room</button><br><br>
  <input id=rc maxlength=4 placeholder="KODE" style="font-size:20px;width:110px;text-align:center;text-transform:uppercase;padding:8px">
  <button onclick="mpConnect('join')">Join Room</button><br><br>${back}`)}
+
 function mpConnect(kind){
   const code=kind=='join'?($('#rc').value||'').trim().toUpperCase():'';
   if(kind=='join'&&code.length!=4)return alert('Masukkan kode room (4 huruf).');
-  if(location.protocol=='file:')return alert('Buka lewat server: node server.js lalu http://localhost:3000');
-  const ws=new WebSocket((location.protocol=='https:'?'wss://':'ws://')+location.host);
-  const me=MP={ws,id:null,hostId:null,host:false,code:'',players:{},starting:false,send:o=>ws.readyState==1&&ws.send(JSON.stringify(o))};
-  ws.onopen=()=>me.send(kind=='join'?{t:'join',code}:{t:'create'});
-  ws.onmessage=e=>onMsg(JSON.parse(e.data));
-  ws.onerror=()=>{if(MP===me){MP=null;alert('Gagal terhubung ke server. Pastikan node server.js berjalan.');}};
-  ws.onclose=()=>{if(MP===me){MP=null;alert('Koneksi terputus.');menu()}};
+  if(typeof Peer=='undefined')return alert('Library PeerJS gagal dimuat. Periksa internet lalu refresh halaman.');
+  if(MP){const old=MP;MP=null;try{old.ws.close()}catch(e){}}
+  kind=='join'?mpJoin(code):mpHost(0);
 }
+
+// ---------- HOST: menjalankan logika room (pengganti server.js) ----------
+function mpHost(tries){
+  const code=newCode();
+  const peer=new Peer(PEER_PREFIX+code);
+  const conns=new Map(),order=[],ready={};
+  let started=false,opened=false;
+
+  const send=(c,o)=>{try{if(c.open)c.send(o)}catch(e){}};
+  const toAll=(o,except)=>conns.forEach((c,id)=>{if(id!=except)send(c,o)});
+  const local=o=>{if(MP===me)onMsg(o)};
+  const lobby=()=>{const o={t:'lobby',host:peer.id,players:order.map(id=>({id,ready:!!ready[id]}))};toAll(o);local(o)};
+  const handle=(id,m)=>{
+    if(!m||typeof m!='object')return;
+    if(m.t=='ready'){
+      if(started)return;
+      ready[id]=!ready[id];lobby();
+      if(order.every(i=>ready[i])){
+        started=true;
+        const go={t:'go',m:Math.floor(Math.random()*3),l:Math.floor(Math.random()*5)};
+        toAll(go);local(go);
+      }
+      return;
+    }
+    m.from=id;toAll(m,id);local(m); // pesan lain diteruskan ke pemain lain + diproses host
+  };
+
+  const ws={readyState:0,onclose:null,close(){
+    if(ws.readyState==3)return;ws.readyState=3;
+    toAll({t:'closed'});
+    setTimeout(()=>{try{peer.destroy()}catch(e){}},300);
+  }};
+  const me=MP={ws,id:null,hostId:null,host:false,code:'',players:{},starting:false,
+    send:o=>{
+      if(ws.readyState!=1||!o)return;
+      if(o.t=='ready')return handle(peer.id,o);
+      toAll(Object.assign({},o,{from:peer.id}));
+    }};
+
+  peer.on('open',()=>{
+    opened=true;ws.readyState=1;order.push(peer.id);
+    local({t:'room',id:peer.id,code});
+    lobby();
+  });
+
+  peer.on('connection',c=>{
+    c.on('open',()=>{
+      if(started||order.length>=4){send(c,{t:'err',msg:ROOM_ERR});setTimeout(()=>{try{c.close()}catch(e){}},400);return}
+      conns.set(c.peer,c);order.push(c.peer);
+      send(c,{t:'room',id:c.peer,code});
+      lobby();
+    });
+    c.on('data',m=>{if(conns.get(c.peer)===c)handle(c.peer,m)});
+    const gone=()=>{
+      if(conns.get(c.peer)!==c)return;
+      conns.delete(c.peer);
+      const i=order.indexOf(c.peer);if(i>=0)order.splice(i,1);
+      delete ready[c.peer];
+      const l={t:'left',from:c.peer};toAll(l);local(l);
+      lobby();
+    };
+    c.on('close',gone);c.on('error',gone);
+  });
+
+  peer.on('disconnected',()=>{try{if(ws.readyState==1&&!peer.destroyed)peer.reconnect()}catch(e){}});
+
+  peer.on('error',e=>{
+    if(e.type=='unavailable-id'&&!opened&&tries<5){ // kode room bentrok, coba kode lain
+      ws.readyState=3;try{peer.destroy()}catch(x){}
+      if(MP===me)MP=null;
+      return mpHost(tries+1);
+    }
+    if(!opened&&MP===me){
+      ws.readyState=3;try{peer.destroy()}catch(x){}
+      MP=null;alert('Gagal membuat room ('+e.type+'). Periksa koneksi internet.');multi();
+    }else console.warn('PeerJS:',e);
+  });
+}
+
+// ---------- PEMAIN: terhubung ke host ----------
+function mpJoin(code){
+  const peer=new Peer();
+  let conn=null,ended=false,joined=false,timer=null;
+
+  const ws={readyState:0,onclose:null,close(){
+    if(ws.readyState==3)return;ws.readyState=3;
+    clearTimeout(timer);
+    try{peer.destroy()}catch(e){}
+  }};
+  const me=MP={ws,id:null,hostId:null,host:false,code:'',players:{},starting:false,
+    send:o=>{try{if(conn&&conn.open)conn.send(o)}catch(e){}}};
+
+  const fail=msg=>{if(MP===me)onMsg({t:'err',msg})};
+  timer=setTimeout(()=>{if(!joined)fail('Gagal terhubung ke room (waktu habis). Cek kode room dan koneksi internet.')},15000);
+
+  peer.on('open',()=>{
+    conn=peer.connect(PEER_PREFIX+code,{reliable:true,serialization:'json'});
+    conn.on('open',()=>{ws.readyState=1});
+    conn.on('data',m=>{
+      if(!m||MP!==me)return;
+      if(m.t=='room'){joined=true;clearTimeout(timer)}
+      if(m.t=='err')clearTimeout(timer);
+      if(m.t=='closed'){ended=true;onMsg(m);ws.close();return}
+      onMsg(m);
+    });
+    conn.on('close',()=>{
+      clearTimeout(timer);
+      if(ended||MP!==me)return;
+      ended=true;
+      if(joined)onMsg({t:'closed'});else fail(ROOM_ERR);
+    });
+    conn.on('error',()=>{if(!joined)fail('Gagal terhubung ke room.')});
+  });
+
+  peer.on('error',e=>{
+    clearTimeout(timer);
+    if(MP!==me)return;
+    if(e.type=='peer-unavailable')fail(ROOM_ERR);
+    else if(!joined)fail('Gagal terhubung ('+e.type+'). Coba lagi.');
+    else console.warn('PeerJS:',e);
+  });
+}
+
 function mpReady(){Sfx.fx.click();MP.send({t:'ready'})}
 function lobbyUI(){const ps=Object.values(MP.players);
   show(`<h2>Lobby</h2><div class=bar>Kode Room: <b style="font-size:34px;letter-spacing:8px">${MP.code}</b></div>
